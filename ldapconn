@@ -1,0 +1,91 @@
+package ldapconnector
+
+import (
+    "github.com/go-ldap/ldap/v3"
+    "sync"
+    "time"
+    "log"
+)
+
+type LDAPPool struct {
+    connections []*ldap.Conn
+    mu          sync.Mutex
+}
+
+func NewLDAPPool(serverURI, userDN, password string, poolSize int) (*LDAPPool, error) {
+    pool := &LDAPPool{
+        connections: make([]*ldap.Conn, poolSize),
+    }
+
+    for i := 0; i < poolSize; i++ {
+        conn, err := ldap.DialURL(serverURI)
+        if err != nil {
+            log.Printf("Failed to dial LDAP server: %v", err)
+            return nil, err
+        }
+        err = conn.Bind(userDN, password)
+        if err != nil {
+            log.Printf("Failed to bind to LDAP server: %v", err)
+            return nil, err
+        }
+        pool.connections[i] = conn
+    }
+
+    return pool, nil
+}
+
+func (pool *LDAPPool) SetIdleTimeout(idleTimeout int) {
+    for _, conn := range pool.connections {
+        go func(conn *ldap.Conn) {
+            time.Sleep(time.Duration(idleTimeout) * time.Second)
+            err := conn.Close()
+            if err != nil {
+                log.Printf("Failed to close idle connection: %v", err)
+            }
+        }(conn)
+    }
+}
+
+func (pool *LDAPPool) ReleaseConnection(conn *ldap.Conn) {
+    pool.mu.Lock()
+    defer pool.mu.Unlock()
+
+    pool.connections = append(pool.connections, conn)
+    log.Printf("Connection released back to pool")
+}
+
+func (pool *LDAPPool) CloseAllConnections() {
+    pool.mu.Lock()
+    defer pool.mu.Unlock()
+
+    for _, conn := range pool.connections {
+        err := conn.Close()
+        if err != nil {
+            log.Printf("Failed to close connection: %v", err)
+        }
+    }
+    pool.connections = nil
+    log.Printf("All connections closed")
+}
+
+func (pool *LDAPPool) Search(baseDN, filter string) ([]*ldap.Entry, error) {
+    pool.mu.Lock()
+    defer pool.mu.Unlock()
+
+    conn := pool.connections // Example: using the first connection
+    searchRequest := ldap.NewSearchRequest(
+        baseDN,
+        ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
+        filter,
+        []string{"dn", "cn"}, // Attributes to retrieve
+        nil,
+    )
+
+    sr, err := conn.Search(searchRequest)
+    if err != nil {
+        log.Printf("LDAP search failed: %v", err)
+        return nil, err
+    }
+
+    return sr.Entries, nil
+}
